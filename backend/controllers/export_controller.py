@@ -139,7 +139,7 @@ def delete_export(project_id, filename):
         return error_response('SERVER_ERROR', str(e), 500)
 
 
-@export_bp.route('/<project_id>/export/pptx', methods=['GET'])
+@export_bp.route('/<project_id>/export/pptx', methods=['GET', 'POST'])
 def export_pptx(project_id):
     """
     GET /api/projects/{project_id}/export/pptx?filename=...&page_ids=id1,id2,id3 - Export PPTX

@@ -157,8 +157,9 @@ def create_app():
     app.register_blueprint(material_bp)
     app.register_blueprint(material_global_bp)
     app.register_blueprint(reference_file_bp, url_prefix='/api/reference-files')
-    app.register_blueprint(settings_bp)
-    app.register_blueprint(openai_oauth_bp)
+    if not app.config.get('KCD_DISABLE_SETTINGS_API', False):
+        app.register_blueprint(settings_bp)
+        app.register_blueprint(openai_oauth_bp)
     app.register_blueprint(style_bp)
 
     with app.app_context():

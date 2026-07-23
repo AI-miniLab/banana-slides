@@ -19,6 +19,7 @@ from werkzeug.utils import secure_filename
 from models import db, Project, Page, Task, ReferenceFile
 from services import ProjectContext, FileService
 from services.ai_service_manager import get_ai_service
+from services.ai_providers.platform_provider import create_platform_ai_service
 from services.task_manager import (
     task_manager,
     generate_descriptions_task,
@@ -34,6 +35,16 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 project_bp = Blueprint('projects', __name__, url_prefix='/api/projects')
+
+
+def _ai_service_for_action(data):
+    """Return a task-scoped platform service without caching its token."""
+    platform_execution = data.pop('platform_execution', None)
+    if platform_execution is None:
+        if current_app.config.get('KCD_PLATFORM_REQUIRED', False):
+            raise ValueError("platform_execution is required")
+        return get_ai_service()
+    return create_platform_ai_service(platform_execution)
 
 
 def _get_required_project_content(data, creation_type):
@@ -479,11 +490,9 @@ def generate_outline(project_id):
         if not project:
             return not_found('Project')
         
-        # Get singleton AI service instance
-        ai_service = get_ai_service()
-        
         # Get request data and language parameter
         data = request.get_json() or {}
+        ai_service = _ai_service_for_action(data)
         language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
         
         # Get reference files content and create project context
@@ -708,8 +717,7 @@ def generate_from_description(project_id):
         
         project.description_text = description_text
         
-        # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = _ai_service_for_action(data)
         
         # Get reference files content and create project context
         reference_files_content = _get_project_reference_files_content(project_id)
@@ -841,8 +849,7 @@ def generate_descriptions(project_id):
         db.session.add(task)
         db.session.commit()
         
-        # Get singleton AI service instance
-        ai_service = get_ai_service()
+        ai_service = _ai_service_for_action(data)
         
         # Get reference files content and create project context
         reference_files_content = _get_project_reference_files_content(project_id)
@@ -1049,6 +1056,7 @@ def generate_images(project_id):
         db.session.expire_all()
         
         data = request.get_json() or {}
+        ai_service = _ai_service_for_action(data)
         
         # Get page_ids from request body and fetch filtered pages
         selected_page_ids = parse_page_ids_from_body(data)
@@ -1098,9 +1106,6 @@ def generate_images(project_id):
         
         db.session.add(task)
         db.session.commit()
-        
-        # Get singleton AI service instance
-        ai_service = get_ai_service()
         
         # 合并额外要求和风格描述
         combined_requirements = project.extra_requirements or ""
