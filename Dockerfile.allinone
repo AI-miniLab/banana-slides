@@ -83,7 +83,8 @@ COPY docker/nginx-allinone.conf /etc/nginx/conf.d/default.conf
 RUN rm -f /etc/nginx/sites-enabled/default
 
 # 启动脚本可执行
-RUN chmod +x /app/docker/start-backend.sh
+RUN sed -i 's/\r$//' /app/docker/start-backend.sh \
+    && chmod +x /app/docker/start-backend.sh
 
 # 创建必要目录
 RUN mkdir -p /app/backend/instance /app/uploads
