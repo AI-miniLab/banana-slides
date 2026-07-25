@@ -20,5 +20,15 @@ This fork is the internal PPT orchestration and rendering engine for 科创点AI
 ## Supply chain and testing
 
 - Base changes on a recorded upstream commit. Upstream syncs require review and a new immutable image digest.
+- Production images must contain a complete, locked Python environment. Entrypoints must never run `uv sync`, `pip install`, or otherwise download/build dependencies.
+- Database migrations run as an explicit one-shot deployment step. The API process must not fall back to `create_all` when a migration fails.
 - Never commit `.env`, user projects, generated decks, provider responses containing secrets, registry credentials, or local databases.
 - Tests must cover token redaction, concurrent job isolation, text/image invocation polling, platform errors, and operation without provider API keys.
+
+## Durable task rules
+
+- Every platform project creation and stage submission has a persisted idempotency receipt with a request hash. Reusing a key with different input is a conflict.
+- Receipts may store project/job/stage identifiers and task state, but never request bodies, execution tokens, credentials, or raw provider responses.
+- Process restarts must convert orphaned processing tasks to a retryable interrupted state. Re-driving the same stage must reuse completed page artifacts.
+- Model invocation keys are derived from stable stage, page, operation, and content identities. Thread scheduling order must not affect idempotency.
+- Background work is bounded. Capacity exhaustion returns a retryable busy response instead of creating an unbounded queue.

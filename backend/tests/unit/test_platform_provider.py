@@ -5,6 +5,7 @@ from PIL import Image
 
 from services.ai_providers.platform_provider import (
     KcdPlatformImageProvider,
+    KcdPlatformTextProvider,
     PlatformExecution,
     PlatformInvocationClient,
     PlatformInvocationError,
@@ -98,6 +99,27 @@ def test_client_returns_standardized_failure_without_echoing_token(monkeypatch):
     with pytest.raises(PlatformInvocationError, match="MODEL_RATE_LIMITED") as raised:
         client.invoke("IMAGE_GENERATION", {"prompt": "test"})
     assert "short-lived-task-token" not in str(raised.value)
+
+
+def test_invocation_key_is_stable_across_clients_and_payload_order():
+    first = PlatformInvocationClient(execution())
+    second = PlatformInvocationClient(execution())
+
+    first_key = first._next_key("TEXT_GENERATION", {"b": 2, "a": 1})
+    second_key = second._next_key("TEXT_GENERATION", {"a": 1, "b": 2})
+
+    assert first_key == second_key
+    assert "short-lived-task-token" not in first_key
+
+
+def test_text_provider_uses_platform_prompt_contract():
+    class FakeClient:
+        def invoke(self, capability, payload):
+            assert capability == "TEXT_GENERATION"
+            assert payload == {"prompt": "build an outline"}
+            return {"text": "outline"}
+
+    assert KcdPlatformTextProvider(FakeClient()).generate_text("build an outline") == "outline"
 
 
 def test_image_provider_accepts_platform_image_result(monkeypatch):

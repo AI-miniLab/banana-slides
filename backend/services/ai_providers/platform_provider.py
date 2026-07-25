@@ -8,8 +8,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import logging
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, List
@@ -72,8 +72,6 @@ class PlatformInvocationClient:
     def __init__(self, execution: PlatformExecution, timeout_seconds: int = 900):
         self.execution = execution
         self.timeout_seconds = max(30, timeout_seconds)
-        self._sequence = 0
-        self._lock = threading.Lock()
 
     def invoke(self, capability: str, input_payload: dict[str, Any]) -> Any:
         invocation_key = self._next_key(capability, input_payload)
@@ -109,11 +107,15 @@ class PlatformInvocationClient:
             invocation = self._data(polled)
 
     def _next_key(self, capability: str, payload: dict[str, Any]) -> str:
-        with self._lock:
-            self._sequence += 1
-            sequence = self._sequence
-        digest = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:16]
-        return f"{self.execution.idempotency_key}:{capability.lower()}:{sequence}:{digest}"
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        return f"{self.execution.idempotency_key}:{capability.lower()}:{digest}"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         url = urljoin(self.execution.gateway_base_url + "/", path.lstrip("/"))
@@ -151,7 +153,7 @@ class KcdPlatformTextProvider(TextProvider):
     def generate_text(self, prompt: str, thinking_budget: int = 1000) -> str:
         result = self.client.invoke(
             "TEXT_GENERATION",
-            {"messages": [{"role": "user", "content": prompt}]},
+            {"prompt": prompt},
         )
         if isinstance(result, str):
             return result

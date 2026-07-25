@@ -280,6 +280,12 @@ def get_ppt_language_instruction(language: str = None) -> str:
 def get_outline_generation_prompt(project_context: 'ProjectContext', language: str = None) -> str:
     """生成 PPT 大纲的 prompt（JSON 输出）"""
     idea_prompt = project_context.idea_prompt or ""
+    page_count_instruction = (
+        f"Generate exactly {project_context.page_count} slides. The JSON must contain exactly "
+        f"{project_context.page_count} pages in total, including the title slide."
+        if project_context.page_count else
+        "Choose an appropriate number of slides for the request."
+    )
 
     prompt = (f"""\
 You are a helpful assistant that generates an outline for a ppt.
@@ -290,6 +296,7 @@ You can organize the content in two ways:
 
 Choose the format that best fits the content. Use parts when the PPT has clear major sections.
 Unless otherwise specified, the first page should be kept simplest, containing only the title, subtitle, and presenter information.
+{page_count_instruction}
 
 The user's request: {idea_prompt}.
 {_format_requirements(project_context.outline_requirements)}Now generate the outline, don't include any other text.

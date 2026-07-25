@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from models import db, Task, Page, Material, PageImageVersion, Settings, ProjectTemplateAsset, Project
 from utils import get_filtered_pages
 from utils.image_utils import check_image_resolution
+from services.platform_submission_service import sync_receipt_terminal_state
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,16 @@ IMAGE_QUALITY_CONTROL_MAX_ATTEMPTS = 3
 
 class ImageQualityControlError(ValueError):
     """Raised when generated images repeatedly fail quality review."""
+
+
+def apply_batch_terminal_state(task, failed: int, total: int, label: str) -> None:
+    """Keep async task state truthful when one or more pages fail."""
+    task.status = 'FAILED' if failed else 'COMPLETED'
+    task.error_message = (
+        f"{label} generation failed for {failed}/{total} pages"
+        if failed else None
+    )
+    task.completed_at = datetime.utcnow()
 
 
 def get_image_prompt_field_names() -> set:
@@ -219,6 +230,10 @@ class ResourceLimiter:
             self.capacity = new_capacity
             self._condition.notify_all()
 
+    def snapshot(self) -> dict:
+        with self._condition:
+            return {'in_use': self._in_use, 'capacity': self.capacity}
+
     @contextmanager
     def slot(self, label: str, on_acquire: Optional[Callable[[], None]] = None):
         waited = False
@@ -250,25 +265,29 @@ class ResourceLimiter:
 class TaskManager:
     """Simple task manager using ThreadPoolExecutor"""
     
-    def __init__(self, max_workers: int = 4):
+    def __init__(self, max_workers: int = 4, max_pending: int | None = None):
         """Initialize task manager"""
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.active_tasks = {}  # task_id -> Future
         self.lock = threading.Lock()
         self.max_workers = max_workers
+        self.max_pending = max_pending or max_workers * 2
     
     def submit_task(self, task_id: str, func: Callable, *args, **kwargs):
         """Submit a background task"""
         with self.lock:
-            executor = self.executor
-
-        future = executor.submit(func, task_id, *args, **kwargs)
-        
-        with self.lock:
+            if task_id in self.active_tasks:
+                return self.active_tasks[task_id]
+            if len(self.active_tasks) >= self.max_pending:
+                raise TaskCapacityError(
+                    f"background task capacity exhausted ({self.max_pending})"
+                )
+            future = self.executor.submit(func, task_id, *args, **kwargs)
             self.active_tasks[task_id] = future
         
         # Add callback to clean up when done and log exceptions
         future.add_done_callback(lambda f: self._task_done_callback(task_id, f))
+        return future
     
     def _task_done_callback(self, task_id: str, future):
         """Handle task completion and log any exceptions"""
@@ -292,6 +311,14 @@ class TaskManager:
         """Check if task is still running"""
         with self.lock:
             return task_id in self.active_tasks
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                'active_and_queued': len(self.active_tasks),
+                'workers': self.max_workers,
+                'pending_capacity': self.max_pending,
+            }
     
     def shutdown(self):
         """Shutdown the executor"""
@@ -310,20 +337,30 @@ class TaskManager:
             old_executor = self.executor
             self.executor = ThreadPoolExecutor(max_workers=new_max_workers)
             self.max_workers = new_max_workers
+            self.max_pending = max(self.max_pending, new_max_workers)
 
         if old_executor is not None:
             old_executor.shutdown(wait=False, cancel_futures=False)
 
 
 def _compute_background_worker_target(description_workers: int, image_workers: int) -> int:
-    """Keep the shared task pool from becoming the product-level bottleneck."""
-    return max(8, int(description_workers) + int(image_workers) + 4)
+    """Keep product concurrency bounded even when desktop settings are larger."""
+    configured = int(os.getenv('MAX_BACKGROUND_TASK_WORKERS', '4'))
+    return max(1, min(configured, 4))
 
 
 # Global task manager and resource limiters
-task_manager = TaskManager(max_workers=max(8, int(os.getenv('MAX_BACKGROUND_TASK_WORKERS', '16'))))
-image_resource_limiter = ResourceLimiter("image", int(os.getenv('MAX_IMAGE_WORKERS', '20')))
-text_resource_limiter = ResourceLimiter("text", int(os.getenv('MAX_DESCRIPTION_WORKERS', '20')))
+class TaskCapacityError(RuntimeError):
+    pass
+
+
+_background_workers = max(1, min(int(os.getenv('MAX_BACKGROUND_TASK_WORKERS', '4')), 4))
+task_manager = TaskManager(
+    max_workers=_background_workers,
+    max_pending=max(_background_workers, int(os.getenv('MAX_PENDING_BACKGROUND_TASKS', '8'))),
+)
+image_resource_limiter = ResourceLimiter("image", max(1, min(int(os.getenv('MAX_IMAGE_WORKERS', '3')), 3)))
+text_resource_limiter = ResourceLimiter("text", max(1, min(int(os.getenv('MAX_DESCRIPTION_WORKERS', '4')), 4)))
 
 
 def sync_resource_limits(description_workers: int, image_workers: int):
@@ -331,8 +368,8 @@ def sync_resource_limits(description_workers: int, image_workers: int):
     task_manager.update_max_workers(
         _compute_background_worker_target(description_workers, image_workers)
     )
-    image_resource_limiter.update_capacity(image_workers)
-    text_resource_limiter.update_capacity(description_workers)
+    image_resource_limiter.update_capacity(max(1, min(int(image_workers), 3)))
+    text_resource_limiter.update_capacity(max(1, min(int(description_workers), 4)))
 
 
 def save_image_with_version(image, project_id: str, page_id: str, file_service,
@@ -359,48 +396,69 @@ def save_image_with_version(image, project_id: str, page_id: str, file_service,
     5. 创建新版本记录
     6. 如果提供了 page_obj，更新页面状态和图片路径
     """
-    # 使用 MAX 查询确保版本号安全（即使有版本被删除也不会重复）
-    max_version = db.session.query(func.max(PageImageVersion.version_number)).filter_by(page_id=page_id).scalar() or 0
-    next_version = max_version + 1
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            # Rebuild the complete unit of work after every rollback. Retrying
+            # commit alone would silently commit an empty transaction.
+            max_version = db.session.query(func.max(PageImageVersion.version_number)).filter_by(
+                page_id=page_id
+            ).scalar() or 0
+            next_version = max_version + 1
+            PageImageVersion.query.filter_by(page_id=page_id).update({'is_current': False})
 
-    # 批量更新：标记所有旧版本为非当前版本（使用单条 SQL 更高效）
-    PageImageVersion.query.filter_by(page_id=page_id).update({'is_current': False})
+            image_path = file_service.save_generated_image(
+                image, project_id, page_id,
+                version_number=next_version,
+                image_format=image_format
+            )
+            cached_image_path = file_service.save_cached_image(
+                image, project_id, page_id,
+                version_number=next_version,
+                quality=85
+            )
 
-    # 保存原图到最终位置（使用版本号）
-    image_path = file_service.save_generated_image(
-        image, project_id, page_id,
-        version_number=next_version,
-        image_format=image_format
-    )
+            db.session.add(PageImageVersion(
+                page_id=page_id,
+                image_path=image_path,
+                version_number=next_version,
+                is_current=True
+            ))
+            if page_obj is not None:
+                current_page = db.session.get(Page, page_id)
+                if current_page is None:
+                    raise ValueError(f"Page not found while saving image: {page_id}")
+                current_page.generated_image_path = image_path
+                current_page.cached_image_path = cached_image_path
+                current_page.status = 'COMPLETED'
+                current_page.updated_at = datetime.utcnow()
 
-    # 生成并保存压缩的缓存图片（用于前端快速显示）
-    cached_image_path = file_service.save_cached_image(
-        image, project_id, page_id,
-        version_number=next_version,
-        quality=85
-    )
+            db.session.commit()
+            logger.debug(
+                "Page %s image saved as version %s: %s, cached: %s",
+                page_id, next_version, image_path, cached_image_path,
+            )
+            return image_path, next_version
+        except OperationalError as exc:
+            db.session.rollback()
+            if not _is_retryable_database_conflict(exc) or attempt >= max_retries - 1:
+                raise
+            delay = 0.2 * (2 ** attempt)
+            logger.warning(
+                "Image version transaction conflicted; retrying in %.1fs (attempt %s/%s)",
+                delay, attempt + 1, max_retries,
+            )
+            time.sleep(delay)
 
-    # 创建新版本记录
-    new_version = PageImageVersion(
-        page_id=page_id,
-        image_path=image_path,
-        version_number=next_version,
-        is_current=True
-    )
-    db.session.add(new_version)
+    raise RuntimeError("image version transaction retry loop exhausted")
 
-    # 如果提供了 page_obj，更新页面状态和图片路径
-    if page_obj:
-        page_obj.generated_image_path = image_path
-        page_obj.cached_image_path = cached_image_path
-        page_obj.status = 'COMPLETED'
-        page_obj.updated_at = datetime.utcnow()
 
-    _commit_with_retry()
-
-    logger.debug(f"Page {page_id} image saved as version {next_version}: {image_path}, cached: {cached_image_path}")
-
-    return image_path, next_version
+def _is_retryable_database_conflict(error: OperationalError) -> bool:
+    original = getattr(error, 'orig', None)
+    args = getattr(original, 'args', ())
+    mysql_code = args[0] if args and isinstance(args[0], int) else None
+    message = str(error).lower()
+    return mysql_code in {1205, 1213} or 'database is locked' in message
 
 
 def resolve_page_template(page, project, file_service):
@@ -612,10 +670,6 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
                 # 关键修复：在子线程中也需要应用上下文
                 with app.app_context():
                     try:
-                        # Get singleton AI service instance
-                        from services.ai_service_manager import get_ai_service
-                        ai_service = get_ai_service()
-                        
                         with text_resource_limiter.slot(
                             f"description project={project_id} page={page_id}"
                         ):
@@ -674,13 +728,17 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
                         db.session.commit()
                         logger.info(f"Description Progress: {completed}/{len(pages)} pages completed")
             
-            # Mark task as completed
+            # Failed pages make the batch failed. The platform must stop the
+            # automatic chain instead of exporting incomplete content.
             task = Task.query.get(task_id)
             if task:
-                task.status = 'COMPLETED'
-                task.completed_at = datetime.utcnow()
+                apply_batch_terminal_state(task, failed, len(pages), "Description")
+                sync_receipt_terminal_state(task)
                 db.session.commit()
-                logger.info(f"Task {task_id} COMPLETED - {completed} pages generated, {failed} failed")
+                logger.info(
+                    f"Task {task_id} {task.status} - "
+                    f"{completed} pages generated, {failed} failed"
+                )
             
             # Update project status
             from models import Project
@@ -697,6 +755,7 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
                 task.status = 'FAILED'
                 task.error_message = str(e)
                 task.completed_at = datetime.utcnow()
+                sync_receipt_terminal_state(task)
                 db.session.commit()
 
 
@@ -920,15 +979,19 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                         db.session.commit()
                         logger.info(f"Image Progress: {completed}/{len(pages)} pages completed")
             
-            # Mark task as completed
+            # A task with missing images is a failed task, not a successful
+            # partial export candidate.
             task = Task.query.get(task_id)
             if task:
-                task.status = 'COMPLETED'
-                task.completed_at = datetime.utcnow()
+                apply_batch_terminal_state(task, failed, len(pages), "Image")
+                sync_receipt_terminal_state(task)
                 if resolution_mismatched > 0:
                     logger.warning(f"Task {task_id} has {resolution_mismatched} resolution mismatches")
                 db.session.commit()
-                logger.info(f"Task {task_id} COMPLETED - {completed} images generated, {failed} failed")
+                logger.info(
+                    f"Task {task_id} {task.status} - "
+                    f"{completed} images generated, {failed} failed"
+                )
             
             # Update project status
             project = Project.query.get(project_id)
@@ -944,6 +1007,7 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                 task.status = 'FAILED'
                 task.error_message = str(e)
                 task.completed_at = datetime.utcnow()
+                sync_receipt_terminal_state(task)
                 db.session.commit()
 
 

@@ -20,12 +20,23 @@ from models import db, Project, Page, Task, ReferenceFile
 from services import ProjectContext, FileService
 from services.ai_service_manager import get_ai_service
 from services.ai_providers.platform_provider import create_platform_ai_service
+from services.platform_submission_service import (
+    SubmissionConflict,
+    attach_project,
+    attach_task,
+    begin_project_creation,
+    begin_submission,
+    mark_completed,
+    mark_failed,
+    receipt_view,
+)
 from services.task_manager import (
     task_manager,
     generate_descriptions_task,
     generate_images_task,
     process_ppt_renovation_task,
     get_image_prompt_field_names,
+    TaskCapacityError,
 )
 from utils import (
     success_response, error_response, not_found, bad_request,
@@ -201,6 +212,17 @@ def _smart_merge_pages(project_id, pages_data):
     return pages_list
 
 
+def _enforce_requested_page_count(project, pages_data):
+    requested = project.page_count
+    if requested and len(pages_data) > requested:
+        logger.warning(
+            "Outline returned %s pages for requested page_count=%s; truncating to contract",
+            len(pages_data), requested,
+        )
+        return pages_data[:requested]
+    return pages_data
+
+
 @project_bp.route('', methods=['GET'])
 def list_projects():
     """
@@ -279,6 +301,11 @@ def create_project():
             if not isinstance(template_style, str):
                 return bad_request("template_style must be a string")
             template_style = template_style.strip() or None
+
+        page_count = data.get('page_count')
+        if page_count is not None:
+            if isinstance(page_count, bool) or not isinstance(page_count, int) or not 1 <= page_count <= 100:
+                return bad_request("page_count must be an integer between 1 and 100")
         
         # Validate and set aspect ratio if provided
         image_aspect_ratio = '16:9'
@@ -288,18 +315,32 @@ def create_project():
             except ValueError as e:
                 return bad_request(str(e))
 
+        receipt, replayed = begin_project_creation(data)
+        if replayed:
+            existing_project = db.session.get(Project, receipt.external_project_id)
+            if existing_project is None:
+                raise SubmissionConflict('idempotency receipt references a missing project')
+            return success_response({
+                'project_id': existing_project.id,
+                'status': existing_project.status,
+                'pages': []
+            })
+
         # Create project
         project = Project(
             creation_type=creation_type,
             idea_prompt=content if creation_type == 'idea' else None,
             outline_text=content if creation_type == 'outline' else None,
             description_text=content if creation_type == 'descriptions' else None,
+            page_count=page_count,
             template_style=template_style,
             image_aspect_ratio=image_aspect_ratio,
             status='DRAFT'
         )
         
         db.session.add(project)
+        db.session.flush()
+        attach_project(receipt, project.id)
         db.session.commit()
         
         return success_response({
@@ -313,6 +354,10 @@ def create_project():
         db.session.rollback()
         logger.warning(f"create_project: Invalid JSON body - {str(e)}")
         return bad_request("Invalid JSON in request body")
+
+    except SubmissionConflict as e:
+        db.session.rollback()
+        return error_response('IDEMPOTENCY_CONFLICT', str(e), 409)
     
     except Exception as e:
         db.session.rollback()
@@ -484,6 +529,7 @@ def generate_outline(project_id):
         "language": "zh"  # output language: zh, en, ja, auto
     }
     """
+    receipt = None
     try:
         project = Project.query.get(project_id)
         
@@ -492,6 +538,10 @@ def generate_outline(project_id):
         
         # Get request data and language parameter
         data = request.get_json() or {}
+        receipt, replayed = begin_submission(data, 'GENERATE_OUTLINE', project_id)
+        if replayed:
+            return success_response(receipt_view(receipt), status_code=200)
+        db.session.commit()
         ai_service = _ai_service_for_action(data)
         language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
         
@@ -535,6 +585,7 @@ def generate_outline(project_id):
         
         # Flatten outline to pages and smart merge with existing
         pages_data = ai_service.flatten_outline(outline)
+        pages_data = _enforce_requested_page_count(project, pages_data)
         pages_list = _smart_merge_pages(project_id, pages_data)
 
         # Update project status (don't downgrade if all pages already have content)
@@ -544,6 +595,7 @@ def generate_outline(project_id):
             project.status = 'OUTLINE_GENERATED'
         project.updated_at = datetime.utcnow()
         
+        mark_completed(receipt)
         db.session.commit()
         
         logger.info(f"大纲生成完成: 项目 {project_id}, 创建了 {len(pages_list)} 个页面")
@@ -553,8 +605,15 @@ def generate_outline(project_id):
             'pages': [page.to_dict() for page in pages_list]
         })
     
+    except SubmissionConflict as e:
+        db.session.rollback()
+        return error_response('IDEMPOTENCY_CONFLICT', str(e), 409)
     except Exception as e:
         db.session.rollback()
+        if receipt is not None and receipt.id is not None:
+            persisted = db.session.get(type(receipt), receipt.id)
+            mark_failed(persisted)
+            db.session.commit()
         logger.error(f"generate_outline failed: {str(e)}", exc_info=True)
         return error_response('AI_SERVICE_ERROR', str(e), 503)
 
@@ -807,6 +866,7 @@ def generate_descriptions(project_id):
         "language": "zh"  # output language: zh, en, ja, auto
     }
     """
+    receipt = None
     try:
         project = Project.query.get(project_id)
         
@@ -829,8 +889,16 @@ def generate_descriptions(project_id):
         outline = _reconstruct_outline_from_pages(pages)
         
         data = request.get_json() or {}
+        receipt, replayed = begin_submission(data, 'GENERATE_DESCRIPTIONS', project_id)
+        if replayed:
+            return success_response(receipt_view(receipt), status_code=202)
         # 从配置中读取默认并发数，如果请求中提供了则使用请求的值
-        max_workers = data.get('max_workers', current_app.config.get('MAX_DESCRIPTION_WORKERS', 5))
+        try:
+            max_workers = max(1, min(int(data.get(
+                'max_workers', current_app.config.get('MAX_DESCRIPTION_WORKERS', 4)
+            )), 4))
+        except (TypeError, ValueError):
+            return bad_request("max_workers must be an integer")
         language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
         detail_level = data.get('detail_level', 'default')
         
@@ -847,6 +915,8 @@ def generate_descriptions(project_id):
         })
         
         db.session.add(task)
+        db.session.flush()
+        attach_task(receipt, task.id)
         db.session.commit()
         
         ai_service = _ai_service_for_action(data)
@@ -882,8 +952,24 @@ def generate_descriptions(project_id):
             'total_pages': len(pages)
         }, status_code=202)
     
+    except SubmissionConflict as e:
+        db.session.rollback()
+        return error_response('IDEMPOTENCY_CONFLICT', str(e), 409)
     except Exception as e:
         db.session.rollback()
+        if isinstance(e, TaskCapacityError):
+            persisted_task = db.session.get(Task, task.id) if 'task' in locals() else None
+            if persisted_task is not None:
+                persisted_task.status = 'FAILED'
+                persisted_task.error_message = str(e)
+            persisted_receipt = db.session.get(type(receipt), receipt.id) if receipt is not None else None
+            mark_failed(persisted_receipt, 'ENGINE_BUSY')
+            db.session.commit()
+            return error_response('ENGINE_BUSY', 'PPT 引擎任务已满，请稍后重试', 429)
+        if receipt is not None and receipt.id is not None:
+            persisted = db.session.get(type(receipt), receipt.id)
+            mark_failed(persisted)
+            db.session.commit()
         logger.error(f"generate_descriptions failed: {str(e)}", exc_info=True)
         return error_response('SERVER_ERROR', str(e), 500)
 
@@ -1043,6 +1129,7 @@ def generate_images(project_id):
         "page_ids": ["id1", "id2"]  # optional: specific page IDs to generate (if not provided, generates all)
     }
     """
+    receipt = None
     try:
         project = Project.query.get(project_id)
         
@@ -1056,6 +1143,9 @@ def generate_images(project_id):
         db.session.expire_all()
         
         data = request.get_json() or {}
+        receipt, replayed = begin_submission(data, 'GENERATE_IMAGES', project_id)
+        if replayed:
+            return success_response(receipt_view(receipt), status_code=202)
         ai_service = _ai_service_for_action(data)
         
         # Get page_ids from request body and fetch filtered pages
@@ -1088,7 +1178,12 @@ def generate_images(project_id):
         outline = _reconstruct_outline_from_pages(pages)
         
         # 从配置中读取默认并发数，如果请求中提供了则使用请求的值
-        max_workers = data.get('max_workers', current_app.config.get('MAX_IMAGE_WORKERS', 8))
+        try:
+            max_workers = max(1, min(int(data.get(
+                'max_workers', current_app.config.get('MAX_IMAGE_WORKERS', 3)
+            )), 3))
+        except (TypeError, ValueError):
+            return bad_request("max_workers must be an integer")
         use_template = data.get('use_template', True)
         language = data.get('language', current_app.config.get('OUTPUT_LANGUAGE', 'zh'))
         
@@ -1105,6 +1200,8 @@ def generate_images(project_id):
         })
         
         db.session.add(task)
+        db.session.flush()
+        attach_task(receipt, task.id)
         db.session.commit()
         
         # 合并额外要求和风格描述
@@ -1152,8 +1249,24 @@ def generate_images(project_id):
             'total_pages': len(pages)
         }, status_code=202)
     
+    except SubmissionConflict as e:
+        db.session.rollback()
+        return error_response('IDEMPOTENCY_CONFLICT', str(e), 409)
     except Exception as e:
         db.session.rollback()
+        if isinstance(e, TaskCapacityError):
+            persisted_task = db.session.get(Task, task.id) if 'task' in locals() else None
+            if persisted_task is not None:
+                persisted_task.status = 'FAILED'
+                persisted_task.error_message = str(e)
+            persisted_receipt = db.session.get(type(receipt), receipt.id) if receipt is not None else None
+            mark_failed(persisted_receipt, 'ENGINE_BUSY')
+            db.session.commit()
+            return error_response('ENGINE_BUSY', 'PPT 引擎任务已满，请稍后重试', 429)
+        if receipt is not None and receipt.id is not None:
+            persisted = db.session.get(type(receipt), receipt.id)
+            mark_failed(persisted)
+            db.session.commit()
         logger.error(f"generate_images failed: {str(e)}", exc_info=True)
         return error_response('SERVER_ERROR', str(e), 500)
 
@@ -1174,6 +1287,20 @@ def get_task_status(project_id, task_id):
     except Exception as e:
         logger.error(f"get_task_status failed: {str(e)}", exc_info=True)
         return error_response('SERVER_ERROR', str(e), 500)
+
+
+@project_bp.route('/<project_id>/submissions/<path:idempotency_key>', methods=['GET'])
+def get_platform_submission(project_id, idempotency_key):
+    """Resolve a platform submission after its mutating HTTP response was lost."""
+    from models import PlatformSubmissionReceipt
+
+    receipt = PlatformSubmissionReceipt.query.filter_by(
+        external_project_id=project_id,
+        idempotency_key=idempotency_key,
+    ).first()
+    if receipt is None:
+        return not_found('Submission')
+    return success_response(receipt_view(receipt))
 
 
 @project_bp.route('/<project_id>/refine/outline', methods=['POST'])

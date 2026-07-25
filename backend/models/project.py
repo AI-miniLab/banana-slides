@@ -21,6 +21,7 @@ class Project(db.Model):
     outline_requirements = db.Column(db.Text, nullable=True)  # 大纲生成要求
     description_requirements = db.Column(db.Text, nullable=True)  # 页面描述生成要求
     creation_type = db.Column(db.String(20), nullable=False, default='idea')  # idea|outline|descriptions
+    page_count = db.Column(db.Integer, nullable=True)
     template_image_path = db.Column(db.String(500), nullable=True)
     template_style = db.Column(db.Text, nullable=True)  # 风格描述文本（无模板图模式）
     template_mode = db.Column(
@@ -73,6 +74,7 @@ class Project(db.Model):
             'outline_requirements': self.outline_requirements,
             'description_requirements': self.description_requirements,
             'creation_type': self.creation_type,
+            'page_count': self.page_count,
             'template_image_url': f'/files/{self.id}/template/{self.template_image_path.split("/")[-1]}' if self.template_image_path else None,
             'template_style': self.template_style,
             'template_mode': self.template_mode or 'single',

@@ -70,6 +70,7 @@ class ProjectContext:
             self.outline_text = project_or_dict.outline_text
             self.description_text = project_or_dict.description_text
             self.creation_type = project_or_dict.creation_type or 'idea'
+            self.page_count = project_or_dict.page_count
             self.outline_requirements = project_or_dict.outline_requirements
             self.description_requirements = project_or_dict.description_requirements
         else:
@@ -78,6 +79,7 @@ class ProjectContext:
             self.outline_text = project_or_dict.get('outline_text')
             self.description_text = project_or_dict.get('description_text')
             self.creation_type = project_or_dict.get('creation_type', 'idea')
+            self.page_count = project_or_dict.get('page_count')
             self.outline_requirements = project_or_dict.get('outline_requirements')
             self.description_requirements = project_or_dict.get('description_requirements')
 
@@ -90,6 +92,7 @@ class ProjectContext:
             'outline_text': self.outline_text,
             'description_text': self.description_text,
             'creation_type': self.creation_type,
+            'page_count': self.page_count,
             'outline_requirements': self.outline_requirements,
             'description_requirements': self.description_requirements,
             'reference_files_content': self.reference_files_content

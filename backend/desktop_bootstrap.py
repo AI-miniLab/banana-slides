@@ -52,6 +52,7 @@ def repair_desktop_settings_schema(db):
         },
         'projects': {
             'project_title': 'VARCHAR(255)',
+            'page_count': 'INTEGER DEFAULT 8',
             'outline_requirements': 'TEXT',
             'description_requirements': 'TEXT',
             'template_style': 'TEXT',
