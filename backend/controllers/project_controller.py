@@ -302,6 +302,13 @@ def create_project():
                 return bad_request("template_style must be a string")
             template_style = template_style.strip() or None
 
+        generation_mode = str(data.get('generation_mode') or 'STANDARD_VISUAL').strip().upper()
+        if generation_mode not in ('STANDARD_VISUAL', 'STRUCTURED_VISUAL'):
+            return bad_request("generation_mode must be STANDARD_VISUAL or STRUCTURED_VISUAL")
+        design_preferences = data.get('design_preferences') or {}
+        if not isinstance(design_preferences, dict):
+            return bad_request("design_preferences must be an object")
+
         page_count = data.get('page_count')
         if page_count is not None:
             if isinstance(page_count, bool) or not isinstance(page_count, int) or not 1 <= page_count <= 100:
@@ -334,9 +341,11 @@ def create_project():
             description_text=content if creation_type == 'descriptions' else None,
             page_count=page_count,
             template_style=template_style,
+            generation_mode=generation_mode,
             image_aspect_ratio=image_aspect_ratio,
             status='DRAFT'
         )
+        project.set_design_preferences(design_preferences)
         
         db.session.add(project)
         db.session.flush()

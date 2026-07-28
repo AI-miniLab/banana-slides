@@ -122,6 +122,24 @@ def test_text_provider_uses_platform_prompt_contract():
     assert KcdPlatformTextProvider(FakeClient()).generate_text("build an outline") == "outline"
 
 
+def test_text_provider_sends_contact_sheet_through_vision_capability(tmp_path):
+    image_path = tmp_path / "contact-sheet.png"
+    Image.new("RGB", (4, 4), "cyan").save(image_path)
+
+    class FakeClient:
+        def invoke(self, capability, payload):
+            assert capability == "VISION_ANALYSIS"
+            assert payload["prompt"] == "review deck"
+            assert payload["referenceImages"][0].startswith("data:image/")
+            assert ";base64," in payload["referenceImages"][0]
+            return {"text": '{"outlierPages":[]}'}
+
+    result = KcdPlatformTextProvider(FakeClient()).generate_with_image(
+        "review deck", str(image_path))
+
+    assert result == '{"outlierPages":[]}'
+
+
 def test_image_provider_accepts_platform_image_result(monkeypatch):
     image = Image.new("RGB", (4, 4), "cyan")
     buffer = io.BytesIO()
@@ -133,6 +151,7 @@ def test_image_provider_accepts_platform_image_result(monkeypatch):
 
         def invoke(self, capability, payload):
             assert capability == "IMAGE_GENERATION"
+            assert payload["_pptOperation"] == "consistency-repair"
             return {"images": [{"url": "https://assets.example/generated.png"}]}
 
     class FakeResponse:
@@ -146,6 +165,7 @@ def test_image_provider_accepts_platform_image_result(monkeypatch):
         lambda *args, **kwargs: FakeResponse(),
     )
 
-    generated = KcdPlatformImageProvider(FakeClient()).generate_image("test")
+    generated = KcdPlatformImageProvider(FakeClient()).generate_image(
+        "test", invocation_operation="consistency-repair")
     assert generated.size == (4, 4)
     generated.close()

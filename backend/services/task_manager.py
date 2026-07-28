@@ -645,6 +645,14 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
             
             if len(pages) != len(pages_data):
                 raise ValueError("Page count mismatch")
+
+            from models import Project
+            from services.visual_design_service import ensure_project_design_spec
+            project = Project.query.get(project_id)
+            if project and project.generation_mode == 'STRUCTURED_VISUAL':
+                with text_resource_limiter.slot(f"design-spec project={project_id}"):
+                    ensure_project_design_spec(project, pages_data, pages, ai_service)
+                db.session.commit()
             
             # Mark all pages as GENERATING_DESCRIPTION before starting
             for page in pages:
@@ -684,6 +692,9 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
                             "text": desc_result['text'],
                             "generated_at": datetime.utcnow().isoformat()
                         }
+                        current_page = Page.query.get(page_id)
+                        if current_page and current_page.get_page_plan():
+                            desc_content['page_plan'] = current_page.get_page_plan()
                         if desc_result.get('extra_fields'):
                             desc_content['extra_fields'] = desc_result['extra_fields']
                         
@@ -741,7 +752,6 @@ def generate_descriptions_task(task_id: str, project_id: str, ai_service,
                 )
             
             # Update project status
-            from models import Project
             project = Project.query.get(project_id)
             if project and failed == 0:
                 project.status = 'DESCRIPTIONS_GENERATED'
@@ -800,6 +810,42 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             )
             quality_control_enabled = get_image_quality_control_enabled()
 
+            from services.visual_design_service import (
+                build_style_board_prompt,
+                bounded_repair_ids,
+                ordered_generation_references,
+                review_local_consistency,
+                review_vision_consistency,
+                structured_prompt_block,
+            )
+            project_for_design = Project.query.get(project_id)
+            structured_visual = bool(
+                project_for_design
+                and project_for_design.generation_mode == 'STRUCTURED_VISUAL'
+                and project_for_design.get_design_spec()
+            )
+            style_board_path = None
+            if structured_visual and getattr(ai_service, 'supports_reference_images', False):
+                if project_for_design.style_board_path:
+                    candidate = file_service.get_absolute_path(project_for_design.style_board_path)
+                    if os.path.isfile(candidate):
+                        style_board_path = candidate
+                if not style_board_path:
+                    with image_resource_limiter.slot(f"style-board project={project_id}"):
+                        style_board = ai_service.generate_image(
+                            build_style_board_prompt(project_for_design),
+                            ref_image_path=None,
+                            aspect_ratio=aspect_ratio,
+                            resolution=resolution,
+                            invocation_operation='style-board',
+                        )
+                    if style_board:
+                        project_for_design.style_board_path = file_service.save_material_image(
+                            style_board, project_id)
+                        db.session.commit()
+                        style_board_path = file_service.get_absolute_path(
+                            project_for_design.style_board_path)
+
             # Build mapping from order_index to page_data so filtered pages
             # get matched to the correct outline entry (not just first N)
             pages_data_by_index = {i: pd for i, pd in enumerate(all_pages_data)}
@@ -820,7 +866,9 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             failed = 0
             resolution_mismatched = 0  # Count of resolution mismatches
             
-            def generate_single_image(page_id, page_data, page_index):
+            def generate_single_image(
+                    page_id, page_data, page_index,
+                    invocation_operation='page-generate'):
                 """
                 Generate image for a single page
                 注意：只传递 page_id（字符串），不传递 ORM 对象，避免跨线程会话问题
@@ -893,14 +941,19 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                                 has_template=has_template_image,
                                 aspect_ratio=aspect_ratio,
                                 page_style_text=page_style_text,
+                                structured_design=structured_prompt_block(
+                                    project_for_template, page_obj),
                             )
                             logger.debug(f"Generated image prompt for page {page_id}")
                             
                             logger.info(f"🎨 Calling AI service to generate image for page {page_index}/{len(pages)}...")
+                            primary_reference, generation_references = ordered_generation_references(
+                                style_board_path, page_ref_image_path, page_additional_ref_images)
                             image = generate_image_until_quality_passes(
                                 lambda: ai_service.generate_image(
-                                    prompt, page_ref_image_path, aspect_ratio, resolution,
-                                    additional_ref_images=page_additional_ref_images if page_additional_ref_images else None
+                                    prompt, primary_reference, aspect_ratio, resolution,
+                                    additional_ref_images=generation_references if generation_references else None,
+                                    invocation_operation=invocation_operation,
                                 ),
                                 ai_service,
                                 prompt,
@@ -978,6 +1031,52 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                         task.set_progress(progress)
                         db.session.commit()
                         logger.info(f"Image Progress: {completed}/{len(pages)} pages completed")
+
+            if structured_visual:
+                db.session.expire_all()
+                project_for_design = Project.query.get(project_id)
+                inspected_pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+                consistency_status, consistency_warnings, outlier_ids = review_local_consistency(
+                    project_for_design, inspected_pages, file_service)
+                vision_warnings, vision_outlier_ids = review_vision_consistency(
+                    project_for_design, inspected_pages, file_service, ai_service)
+                consistency_warnings.extend(vision_warnings)
+                outlier_ids = list(dict.fromkeys([*outlier_ids, *vision_outlier_ids]))
+                if consistency_warnings:
+                    consistency_status = 'WARNING'
+                repair_ids = bounded_repair_ids(outlier_ids, len(inspected_pages))
+                if repair_ids:
+                    pages_by_id = {page.id: page for page in inspected_pages}
+                    for repair_id in repair_ids:
+                        repair_page = pages_by_id.get(repair_id)
+                        if repair_page is None:
+                            continue
+                        _, _, repair_error, _ = generate_single_image(
+                            repair_page.id,
+                            pages_data_by_index.get(repair_page.order_index, {}),
+                            repair_page.order_index + 1,
+                            invocation_operation='consistency-repair',
+                        )
+                        if repair_error:
+                            consistency_warnings.append({
+                                'pageId': repair_page.id,
+                                'code': 'CONSISTENCY_REPAIR_FAILED',
+                                'message': str(repair_error)[:200],
+                            })
+                    db.session.expire_all()
+                    inspected_pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+                    consistency_status, post_warnings, _ = review_local_consistency(
+                        project_for_design, inspected_pages, file_service)
+                    consistency_warnings = [
+                        warning for warning in consistency_warnings
+                        if warning.get('code') in {'CONSISTENCY_REPAIR_FAILED', 'VISION_REVIEW_UNAVAILABLE'}
+                        or warning.get('pageId') not in repair_ids
+                    ] + post_warnings
+                    if consistency_warnings:
+                        consistency_status = 'WARNING'
+                project_for_design.consistency_status = consistency_status
+                project_for_design.set_consistency_warnings(consistency_warnings)
+                db.session.commit()
             
             # A task with missing images is a failed task, not a successful
             # partial export candidate.
@@ -1104,6 +1203,10 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
             if page.part:
                 page_data['part'] = page.part
 
+            from services.visual_design_service import (
+                ordered_generation_references,
+                structured_prompt_block,
+            )
             prompt = ai_service.generate_image_prompt(
                 outline, page_data, desc_text, page.order_index + 1,
                 has_material_images=has_material_images,
@@ -1112,7 +1215,18 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
                 has_template=has_template_image,
                 aspect_ratio=aspect_ratio,
                 page_style_text=page_style_text,
+                structured_design=structured_prompt_block(project_for_template, page),
             )
+
+            style_board_path = None
+            if (project_for_template.generation_mode == 'STRUCTURED_VISUAL'
+                    and project_for_template.style_board_path
+                    and getattr(ai_service, 'supports_reference_images', False)):
+                candidate = file_service.get_absolute_path(project_for_template.style_board_path)
+                if os.path.isfile(candidate):
+                    style_board_path = candidate
+            primary_reference, generation_references = ordered_generation_references(
+                style_board_path, ref_image_path, additional_ref_images)
 
             def mark_generating():
                 task_obj = Task.query.get(task_id)
@@ -1131,8 +1245,9 @@ def generate_single_page_image_task(task_id: str, project_id: str, page_id: str,
                 logger.info(f"🎨 Generating image for page {page_id}...")
                 image = generate_image_until_quality_passes(
                     lambda: ai_service.generate_image(
-                        prompt, ref_image_path, aspect_ratio, resolution,
-                        additional_ref_images=additional_ref_images if additional_ref_images else None
+                        prompt, primary_reference, aspect_ratio, resolution,
+                        additional_ref_images=generation_references if generation_references else None,
+                        invocation_operation='page-regenerate',
                     ),
                     ai_service,
                     prompt,

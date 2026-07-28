@@ -16,6 +16,11 @@ This fork is the internal PPT orchestration and rendering engine for 科创点AI
 - The built-in frontend and user-editable provider settings are disabled in the product image.
 - Only health, project actions, task status, and file/export endpoints are part of the product API.
 - Preserve compatibility with the platform OpenAPI contract and fixtures in the main repository.
+- `STRUCTURED_VISUAL` is a full-slide image consistency mode, not a native PowerPoint Master/Layout or DrawingML implementation.
+- Treat platform-provided design preferences as inputs and the generated visual bible as a versioned, hashed artifact. Freeze it before parallel image generation.
+- Every structured page prompt must carry the same visual-bible hash plus one validated page archetype. Page-local text may not override palette, typography, grid, medium, or forbidden-variation rules.
+- Generate at most one reusable style board per design-spec hash. When reference images are supported it is the first style reference for every page; content assets follow it.
+- Cross-page review must degrade to warnings when vision analysis is unavailable. Repair at most once and for at most 20 percent of pages, rounded up; never discard the last successful page image.
 
 ## Supply chain and testing
 
@@ -32,3 +37,4 @@ This fork is the internal PPT orchestration and rendering engine for 科创点AI
 - Process restarts must convert orphaned processing tasks to a retryable interrupted state. Re-driving the same stage must reuse completed page artifacts.
 - Model invocation keys are derived from stable stage, page, operation, and content identities. Thread scheduling order must not affect idempotency.
 - Background work is bounded. Capacity exhaustion returns a retryable busy response instead of creating an unbounded queue.
+- Style-board, visual-review, and repair invocation keys derive from stable project, design-spec, page, and operation identities. Thread completion order must not affect them.

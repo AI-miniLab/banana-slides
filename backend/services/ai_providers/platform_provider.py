@@ -35,6 +35,7 @@ class PlatformExecution:
     idempotency_key: str
     gateway_base_url: str
     execution_token: str
+    supports_reference_images: bool = False
 
     @classmethod
     def from_request(cls, value: Any) -> "PlatformExecution":
@@ -56,6 +57,7 @@ class PlatformExecution:
             idempotency_key=str(value["idempotency_key"]),
             gateway_base_url=base_url,
             execution_token=str(value["execution_token"]),
+            supports_reference_images=bool(value.get("supports_reference_images", False)),
         )
 
     def redacted(self) -> dict[str, Any]:
@@ -65,6 +67,7 @@ class PlatformExecution:
             "idempotency_key": self.idempotency_key,
             "gateway_base_url": self.gateway_base_url,
             "execution_token": "***",
+            "supports_reference_images": self.supports_reference_images,
         }
 
 
@@ -163,8 +166,25 @@ class KcdPlatformTextProvider(TextProvider):
                 return str(value)
         raise PlatformInvocationError("platform text result is empty")
 
+    def generate_with_image(self, prompt: str, image_path: str, **_: Any) -> str:
+        with Image.open(image_path) as image:
+            data_url = KcdPlatformImageProvider._data_url(image)
+        result = self.client.invoke(
+            "VISION_ANALYSIS",
+            {"prompt": prompt, "referenceImages": [data_url]},
+        )
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            value = result.get("text") or result.get("content")
+            if value is not None:
+                return str(value)
+        raise PlatformInvocationError("platform vision result is empty")
+
 
 class KcdPlatformImageProvider(ImageProvider):
+    supports_invocation_operation = True
+
     def __init__(self, client: PlatformInvocationClient):
         self.client = client
 
@@ -176,6 +196,7 @@ class KcdPlatformImageProvider(ImageProvider):
         resolution: str = "2K",
         enable_thinking: bool = False,
         thinking_budget: int = 0,
+        invocation_operation: Optional[str] = None,
     ) -> Optional[Image.Image]:
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -183,6 +204,8 @@ class KcdPlatformImageProvider(ImageProvider):
             "resolution": resolution,
             "count": 1,
         }
+        if invocation_operation:
+            payload["_pptOperation"] = str(invocation_operation).strip()[:64]
         if ref_images:
             payload["referenceImages"] = [self._data_url(image) for image in ref_images]
         result = self.client.invoke("IMAGE_GENERATION", payload)
@@ -237,4 +260,6 @@ def create_platform_ai_service(value: Any):
     client = PlatformInvocationClient(execution)
     text = KcdPlatformTextProvider(client)
     image = KcdPlatformImageProvider(client)
-    return AIService(text_provider=text, image_provider=image, caption_provider=text)
+    service = AIService(text_provider=text, image_provider=image, caption_provider=text)
+    service.supports_reference_images = execution.supports_reference_images
+    return service

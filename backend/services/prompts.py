@@ -827,7 +827,8 @@ def get_image_generation_prompt(page_desc: str, outline_text: str,
                                 has_template: bool = True,
                                 page_index: int = 1,
                                 aspect_ratio: str = "16:9",
-                                page_style_text: str = None) -> str:
+                                page_style_text: str = None,
+                                structured_design: str = None) -> str:
     """生成图片生成 prompt
 
     has_template: 是否有模板**图片**(用作 ref_image)。控制 "和模板图片严格相似" 措辞。
@@ -857,6 +858,17 @@ def get_image_generation_prompt(page_desc: str, outline_text: str,
             "- 必须遵循上述 page_style 中的视觉风格、配色、版式语言。"
         )
 
+    structured_design_block = ""
+    if structured_design and structured_design.strip():
+        structured_design_block = (
+            "\n\n<locked_design_contract>\n"
+            f"{structured_design.strip()}\n"
+            "</locked_design_contract>\n"
+            "- The locked design contract is authoritative for palette, typography, grid, recurring components, visual medium and forbidden variations.\n"
+            "- Follow the pagePlan archetype and regions while preserving that same design system.\n"
+            "- Page content and page-local requests must never create a second theme or override the locked contract."
+        )
+
     prompt = (f"""\
 你是一位专家级UI UX演示设计师，专注于生成设计良好的PPT页面。
 当前PPT页面的页面描述如下:
@@ -864,6 +876,7 @@ def get_image_generation_prompt(page_desc: str, outline_text: str,
 {page_desc}
 </page_description>
 {page_style_block}
+{structured_design_block}
 
 <design_guidelines>
 - 要求文字清晰锐利, 画面为4K分辨率，{aspect_ratio}比例。
