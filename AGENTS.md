@@ -29,6 +29,7 @@ This fork is the internal PPT orchestration and rendering engine for 科创点AI
 - Database migrations run as an explicit one-shot deployment step. The API process must not fall back to `create_all` when a migration fails.
 - Never commit `.env`, user projects, generated decks, provider responses containing secrets, registry credentials, or local databases.
 - Tests must cover token redaction, concurrent job isolation, text/image invocation polling, platform errors, and operation without provider API keys.
+- Before opening or updating a Fork PR, fetch its target branch and run the exact CI command against the PR merge result. Running selected tests against the source branch alone is insufficient.
 
 ## Durable task rules
 

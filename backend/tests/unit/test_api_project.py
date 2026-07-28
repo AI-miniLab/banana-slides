@@ -61,6 +61,19 @@ class TestProjectCreate:
         assert 'Generate exactly 3 slides' in prompt
         assert 'exactly 3 pages in total' in prompt
 
+    def test_outline_prompt_keeps_legacy_context_without_page_count(self):
+        from services.prompts import get_outline_generation_prompt
+
+        legacy_context = type('LegacyContext', (), {
+            'idea_prompt': '兼容旧版大纲提示词上下文',
+            'outline_requirements': None,
+            'reference_files_content': [],
+        })()
+
+        prompt = get_outline_generation_prompt(legacy_context, language='zh')
+
+        assert 'Choose an appropriate number of slides for the request.' in prompt
+
     def test_outline_result_is_truncated_to_requested_page_count(self):
         from controllers.project_controller import _enforce_requested_page_count
 

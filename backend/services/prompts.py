@@ -280,10 +280,11 @@ def get_ppt_language_instruction(language: str = None) -> str:
 def get_outline_generation_prompt(project_context: 'ProjectContext', language: str = None) -> str:
     """生成 PPT 大纲的 prompt（JSON 输出）"""
     idea_prompt = project_context.idea_prompt or ""
+    page_count = getattr(project_context, 'page_count', None)
     page_count_instruction = (
-        f"Generate exactly {project_context.page_count} slides. The JSON must contain exactly "
-        f"{project_context.page_count} pages in total, including the title slide."
-        if project_context.page_count else
+        f"Generate exactly {page_count} slides. The JSON must contain exactly "
+        f"{page_count} pages in total, including the title slide."
+        if page_count else
         "Choose an appropriate number of slides for the request."
     )
 
