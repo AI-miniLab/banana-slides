@@ -249,7 +249,9 @@ def create_app():
 
     @app.route('/readyz')
     def readiness_check():
+        from pathlib import Path
         from sqlalchemy import text
+        from schema_compatibility import inspect_schema
         from services.task_manager import (
             image_resource_limiter,
             task_manager,
@@ -257,6 +259,20 @@ def create_app():
         )
         try:
             db.session.execute(text('SELECT 1'))
+            if app.config.get('KCD_PLATFORM_REQUIRED', False):
+                migrations_dir = Path(__file__).resolve().parent / 'migrations'
+                compatibility = inspect_schema(db.engine, migrations_dir)
+                if not compatibility.compatible:
+                    logging.getLogger(__name__).error(
+                        'Banana schema is incompatible: current=%s expected=%s missing=%s',
+                        compatibility.current_revisions,
+                        compatibility.expected_revisions,
+                        compatibility.missing_columns + compatibility.invalid_columns,
+                    )
+                    return {
+                        'status': 'not_ready',
+                        'error': {'code': 'ENGINE_SCHEMA_MISMATCH'},
+                    }, 503
             return {
                 'status': 'ready',
                 'capacity': {
@@ -265,9 +281,13 @@ def create_app():
                     'images': image_resource_limiter.snapshot(),
                 },
             }
-        except SQLAlchemyError:
+        except Exception:
             db.session.rollback()
-            return {'status': 'not_ready'}, 503
+            logging.getLogger(__name__).exception('Banana database readiness check failed')
+            return {
+                'status': 'not_ready',
+                'error': {'code': 'ENGINE_DATABASE_UNAVAILABLE'},
+            }, 503
 
     @app.route('/health')
     def health_check():

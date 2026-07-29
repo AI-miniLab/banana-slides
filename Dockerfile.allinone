@@ -91,7 +91,8 @@ RUN rm -f /etc/nginx/sites-enabled/default
 # 启动脚本可执行
 RUN sed -i 's/\r$//' /app/docker/start-backend.sh \
     && sed -i 's/\r$//' /app/docker/migrate-backend.sh \
-    && chmod +x /app/docker/start-backend.sh /app/docker/migrate-backend.sh
+    && sed -i 's/\r$//' /app/docker/verify-schema.py \
+    && chmod +x /app/docker/start-backend.sh /app/docker/migrate-backend.sh /app/docker/verify-schema.py
 
 # 创建必要目录
 RUN mkdir -p /app/backend/instance /app/uploads
