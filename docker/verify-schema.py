@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/app/.venv/bin/python
 """Fail unless the configured database matches this image's schema contract."""
 
 import os
