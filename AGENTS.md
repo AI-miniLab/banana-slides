@@ -27,6 +27,8 @@ This fork is the internal PPT orchestration and rendering engine for 科创点AI
 - Base changes on a recorded upstream commit. Upstream syncs require review and a new immutable image digest.
 - Production images must contain a complete, locked Python environment. Entrypoints must never run `uv sync`, `pip install`, or otherwise download/build dependencies.
 - Database migrations run as an explicit one-shot deployment step. The API process must not fall back to `create_all` when a migration fails.
+- Production readiness must reject a database whose Alembic revision is behind the image head or whose required schema columns are missing. Liveness must remain dependency-free.
+- Schema incompatibility must return a stable machine-readable error and never expose SQL, driver exceptions, credentials, or database URLs to platform callers.
 - Never commit `.env`, user projects, generated decks, provider responses containing secrets, registry credentials, or local databases.
 - Tests must cover token redaction, concurrent job isolation, text/image invocation polling, platform errors, and operation without provider API keys.
 - Before opening or updating a Fork PR, fetch its target branch and run the exact CI command against the PR merge result. Running selected tests against the source branch alone is insufficient.
