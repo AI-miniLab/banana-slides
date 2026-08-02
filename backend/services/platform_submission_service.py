@@ -134,7 +134,8 @@ def sync_receipt_terminal_state(task):
         receipt.error_code = 'ENGINE_INTERRUPTED'
         receipt.updated_at = datetime.utcnow()
     else:
-        mark_failed(receipt)
+        progress = task.get_progress() if hasattr(task, 'get_progress') else {}
+        mark_failed(receipt, progress.get('error_code') or 'ENGINE_TASK_FAILED')
     return receipt
 
 

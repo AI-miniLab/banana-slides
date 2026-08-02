@@ -6,6 +6,8 @@ import pytest
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from conftest import assert_success_response, assert_error_response
 
@@ -341,6 +343,67 @@ class TestProjectGet:
         
         # 可能返回404或400
         assert response.status_code in [400, 404]
+
+
+class TestImageBatchRecovery:
+    def test_resume_missing_submits_only_pages_without_readable_images(
+        self, client, app, monkeypatch
+    ):
+        from models import db, Page, Project
+        from controllers import project_controller as project_controller_module
+
+        with app.app_context():
+            project = Project(
+                id="project-resume-missing",
+                creation_type="idea",
+                idea_prompt="partial visual",
+                template_style="clean",
+                status="DESCRIPTIONS_GENERATED",
+            )
+            project_id = project.id
+            db.session.add(project)
+            pages = []
+            for index in range(3):
+                page = Page(
+                    id=f"page-{index + 1}",
+                    project_id=project.id,
+                    order_index=index,
+                    status="FAILED" if index == 1 else "COMPLETED",
+                )
+                page.set_outline_content({"title": f"Page {index + 1}", "points": []})
+                page.set_description_content({"text": f"Description {index + 1}"})
+                relative_path = f"projects/{project.id}/pages/{page.id}.png"
+                page.generated_image_path = relative_path
+                if index != 1:
+                    absolute_path = Path(app.config["UPLOAD_FOLDER"]) / relative_path
+                    absolute_path.parent.mkdir(parents=True, exist_ok=True)
+                    absolute_path.write_bytes(b"valid image artifact")
+                db.session.add(page)
+                pages.append(page)
+            db.session.commit()
+
+        submit_calls = []
+        monkeypatch.setattr(
+            project_controller_module,
+            "_ai_service_for_action",
+            lambda _data: SimpleNamespace(),
+        )
+        monkeypatch.setattr(
+            project_controller_module.task_manager,
+            "submit_task",
+            lambda *args: submit_calls.append(args),
+        )
+
+        response = client.post(
+            f"/api/projects/{project_id}/generate/images",
+            json={"resume_missing": True, "page_ids": ["page-1"]},
+        )
+        data = assert_success_response(response, 202)["data"]
+
+        assert data["total_pages"] == 3
+        assert data["target_pages"] == 1
+        assert len(submit_calls) == 1
+        assert submit_calls[0][13] == ["page-2"]
 
 
 class TestResourceConcurrency:
