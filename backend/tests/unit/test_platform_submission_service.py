@@ -84,6 +84,23 @@ def test_async_task_terminal_state_updates_linked_receipt(
     assert receipt.error_code == expected_error
 
 
+def test_failed_image_receipt_preserves_partial_failure_code(db_session):
+    receipt, _ = begin_submission(payload(), "GENERATE_IMAGES", "engine-project")
+    attach_task(receipt, "task-partial")
+    db.session.commit()
+
+    synced = sync_receipt_terminal_state(SimpleNamespace(
+        id="task-partial",
+        status="FAILED",
+        get_progress=lambda: {"error_code": "IMAGE_PARTIAL_FAILURE"},
+    ))
+    db.session.commit()
+
+    assert synced.id == receipt.id
+    assert receipt.status == "FAILED"
+    assert receipt.error_code == "IMAGE_PARTIAL_FAILURE"
+
+
 def test_non_terminal_task_does_not_change_receipt(db_session):
     receipt, _ = begin_submission(payload(), "GENERATE_IMAGES", "engine-project")
     attach_task(receipt, "task-123")

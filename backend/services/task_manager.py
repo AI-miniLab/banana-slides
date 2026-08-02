@@ -41,6 +41,97 @@ def apply_batch_terminal_state(task, failed: int, total: int, label: str) -> Non
     task.completed_at = datetime.utcnow()
 
 
+def page_has_readable_image(page, file_service) -> bool:
+    """Return true only when the page points to an artifact that still exists."""
+    image_path = getattr(page, 'generated_image_path', None)
+    if not image_path:
+        return False
+    try:
+        return os.path.isfile(file_service.get_absolute_path(image_path))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _safe_page_error(error: Exception) -> dict:
+    message = str(error or '')
+    if 'MODEL_005' in message or 'MODEL_RISK_CONTROL_REJECTED' in message:
+        return {
+            'code': 'MODEL_005',
+            'message': '页面内容未通过模型安全检查，已尝试安全视觉降级',
+        }
+    return {
+        'code': 'MODEL_CALL_FAILED',
+        'message': '页面图片生成失败，请稍后重试',
+    }
+
+
+def _is_model_safety_rejection(error: Exception) -> bool:
+    message = str(error or '')
+    return 'MODEL_005' in message or 'MODEL_RISK_CONTROL_REJECTED' in message
+
+
+def _safe_visual_fallback_prompt(prompt: str) -> str:
+    if '<safety_visual_fallback>' in prompt:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "<safety_visual_fallback>\n"
+        "Preserve all factual on-slide text and the locked design contract. "
+        "Replace requests for recognizable real-person likenesses or documentary photos "
+        "with an abstract editorial illustration, symbolic sports composition, silhouettes, "
+        "or an information graphic. Do not imitate a real person's face.\n"
+        "</safety_visual_fallback>"
+    )
+
+
+def apply_image_terminal_state(
+    task,
+    project_id: str,
+    file_service,
+    generated_page_ids: set,
+    attempt_errors: dict,
+) -> None:
+    """Finish an image task from project-wide artifact availability, not attempt counts."""
+    pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
+    available_pages = [page for page in pages if page_has_readable_image(page, file_service)]
+    missing_pages = [page for page in pages if not page_has_readable_image(page, file_service)]
+    retained = max(0, len(available_pages) - len(generated_page_ids))
+    page_errors = []
+    for page in missing_pages:
+        error = attempt_errors.get(page.id)
+        if error:
+            safe_error = _safe_page_error(error)
+            page_errors.append({
+                'pageId': page.id,
+                'pageNo': page.order_index + 1,
+                **safe_error,
+            })
+
+    previous_progress = task.get_progress() or {}
+    progress = {
+        'total': len(pages),
+        'completed': len(available_pages),
+        'generated': len(generated_page_ids),
+        'retained': retained,
+        'available': len(available_pages),
+        'missing': len(missing_pages),
+        'failed': len(missing_pages),
+        'missing_page_ids': [page.id for page in missing_pages],
+        'missing_page_numbers': [page.order_index + 1 for page in missing_pages],
+        'page_errors': page_errors,
+        'error_code': 'IMAGE_PARTIAL_FAILURE' if missing_pages else None,
+    }
+    if previous_progress.get('warning_message'):
+        progress['warning_message'] = previous_progress['warning_message']
+    task.set_progress(progress)
+    task.status = 'FAILED' if missing_pages else 'COMPLETED'
+    task.error_message = (
+        f"Image generation incomplete: {len(available_pages)}/{len(pages)} pages available"
+        if missing_pages else None
+    )
+    task.completed_at = datetime.utcnow()
+
+
 def get_image_prompt_field_names() -> set:
     """读取设置中允许进入文生图 prompt 的额外字段名。"""
     try:
@@ -859,11 +950,26 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             # 注意：不在任务开始时获取模板路径，而是在每个子线程中动态获取
             # 这样可以确保即使用户在上传新模板后立即生成，也能使用最新模板
             
-            # Initialize progress
+            # Initialize progress against the whole project so a missing-only
+            # retry reports 7/8 rather than 0/1.
+            all_project_pages = Page.query.filter_by(project_id=project_id).all()
+            target_page_ids = {page.id for page in pages}
+            retained_before = sum(
+                1 for page in all_project_pages
+                if page.id not in target_page_ids
+                and page_has_readable_image(page, file_service)
+            )
             task.set_progress({
-                "total": len(pages),
-                "completed": 0,
-                "failed": 0
+                "total": len(all_project_pages),
+                "completed": retained_before,
+                "generated": 0,
+                "retained": retained_before,
+                "available": retained_before,
+                "missing": len(all_project_pages) - retained_before,
+                "failed": 0,
+                "missing_page_ids": [page.id for page in pages],
+                "missing_page_numbers": [page.order_index + 1 for page in pages],
+                "page_errors": [],
             })
             db.session.commit()
             
@@ -871,6 +977,8 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             completed = 0
             failed = 0
             resolution_mismatched = 0  # Count of resolution mismatches
+            generated_page_ids = set()
+            attempt_errors = {}
             
             def generate_single_image(
                     page_id, page_data, page_index,
@@ -955,19 +1063,42 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                             logger.info(f"🎨 Calling AI service to generate image for page {page_index}/{len(pages)}...")
                             primary_reference, generation_references = ordered_generation_references(
                                 style_board_path, page_ref_image_path, page_additional_ref_images)
-                            image = generate_image_until_quality_passes(
-                                lambda: ai_service.generate_image(
-                                    prompt, primary_reference, aspect_ratio, resolution,
-                                    additional_ref_images=generation_references if generation_references else None,
-                                    invocation_operation=invocation_operation,
-                                ),
-                                ai_service,
-                                prompt,
-                                desc_text,
-                                page_data=page_data,
-                                page_index=_get_absolute_page_index(page_obj, page_index),
-                                quality_control_enabled=quality_control_enabled,
-                            )
+                            try:
+                                image = generate_image_until_quality_passes(
+                                    lambda: ai_service.generate_image(
+                                        prompt, primary_reference, aspect_ratio, resolution,
+                                        additional_ref_images=generation_references if generation_references else None,
+                                        invocation_operation=invocation_operation,
+                                    ),
+                                    ai_service,
+                                    prompt,
+                                    desc_text,
+                                    page_data=page_data,
+                                    page_index=_get_absolute_page_index(page_obj, page_index),
+                                    quality_control_enabled=quality_control_enabled,
+                                )
+                            except Exception as primary_error:
+                                if not _is_model_safety_rejection(primary_error):
+                                    raise
+                                fallback_prompt = _safe_visual_fallback_prompt(prompt)
+                                logger.warning(
+                                    "Image safety fallback triggered for page %s",
+                                    page_id,
+                                )
+                                image = generate_image_until_quality_passes(
+                                    lambda: ai_service.generate_image(
+                                        fallback_prompt, primary_reference, aspect_ratio, resolution,
+                                        additional_ref_images=generation_references if generation_references else None,
+                                        invocation_operation=f'{invocation_operation}-safety-fallback',
+                                    ),
+                                    ai_service,
+                                    fallback_prompt,
+                                    desc_text,
+                                    page_data=page_data,
+                                    page_index=_get_absolute_page_index(page_obj, page_index),
+                                    quality_control_enabled=quality_control_enabled,
+                                    max_attempts=1,
+                                )
                         logger.info(f"✅ Image generated successfully for page {page_index}")
                         
                         if not image:
@@ -1018,10 +1149,12 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                         if error:
                             page.status = 'FAILED'
                             failed += 1
+                            attempt_errors[page_id] = error
                             db.session.commit()
                         else:
                             # 图片已在子线程中保存并创建版本记录，这里只需要更新计数
                             completed += 1
+                            generated_page_ids.add(page_id)
                             # 刷新页面对象以获取最新状态
                             db.session.refresh(page)
                     
@@ -1029,7 +1162,12 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                     task = Task.query.get(task_id)
                     if task:
                         progress = task.get_progress()
-                        progress['completed'] = completed
+                        progress['completed'] = retained_before + completed
+                        progress['generated'] = completed
+                        progress['retained'] = retained_before
+                        progress['available'] = retained_before + completed
+                        progress['missing'] = max(
+                            0, len(all_project_pages) - retained_before - completed)
                         progress['failed'] = failed
                         # 第一次检测到不匹配时设置警告
                         if resolution_mismatched > 0 and 'warning_message' not in progress:
@@ -1038,7 +1176,11 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                         db.session.commit()
                         logger.info(f"Image Progress: {completed}/{len(pages)} pages completed")
 
-            if structured_visual:
+            project_pages_complete = all(
+                page_has_readable_image(page, file_service)
+                for page in Page.query.filter_by(project_id=project_id).all()
+            )
+            if structured_visual and project_pages_complete:
                 db.session.expire_all()
                 project_for_design = Project.query.get(project_id)
                 inspected_pages = Page.query.filter_by(project_id=project_id).order_by(Page.order_index).all()
@@ -1084,11 +1226,17 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
                 project_for_design.set_consistency_warnings(consistency_warnings)
                 db.session.commit()
             
-            # A task with missing images is a failed task, not a successful
-            # partial export candidate.
+            # Finish from project-wide artifact availability. A failed
+            # regeneration may retain a readable image from an earlier attempt.
             task = Task.query.get(task_id)
             if task:
-                apply_batch_terminal_state(task, failed, len(pages), "Image")
+                apply_image_terminal_state(
+                    task,
+                    project_id,
+                    file_service,
+                    generated_page_ids,
+                    attempt_errors,
+                )
                 sync_receipt_terminal_state(task)
                 if resolution_mismatched > 0:
                     logger.warning(f"Task {task_id} has {resolution_mismatched} resolution mismatches")
@@ -1100,7 +1248,7 @@ def generate_images_task(task_id: str, project_id: str, ai_service, file_service
             
             # Update project status
             project = Project.query.get(project_id)
-            if project and failed == 0:
+            if project and task and task.status == 'COMPLETED':
                 project.status = 'COMPLETED'
                 db.session.commit()
                 logger.info(f"Project {project_id} status updated to COMPLETED")

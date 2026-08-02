@@ -41,3 +41,7 @@ This fork is the internal PPT orchestration and rendering engine for 科创点AI
 - Model invocation keys are derived from stable stage, page, operation, and content identities. Thread scheduling order must not affect idempotency.
 - Background work is bounded. Capacity exhaustion returns a retryable busy response instead of creating an unbounded queue.
 - Style-board, visual-review, and repair invocation keys derive from stable project, design-spec, page, and operation identities. Thread completion order must not affect them.
+- Batch image progress must distinguish images generated in the current attempt, valid images retained from earlier attempts, and pages that still have no readable artifact.
+- Retrying a failed image stage must support a missing-only mode. It may not regenerate a page whose current image artifact is still readable.
+- A batch may complete only when every target project page has a readable image. Partial artifacts remain available, while export stays blocked until the deck is complete.
+- Model safety rejection may trigger at most one deterministic, content-preserving visual fallback. The fallback must use an abstract editorial illustration or information graphic and must not attempt to evade provider policy.

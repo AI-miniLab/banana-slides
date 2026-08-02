@@ -36,6 +36,7 @@ from services.task_manager import (
     generate_images_task,
     process_ppt_renovation_task,
     get_image_prompt_field_names,
+    page_has_readable_image,
     TaskCapacityError,
 )
 from utils import (
@@ -1157,16 +1158,61 @@ def generate_images(project_id):
             return success_response(receipt_view(receipt), status_code=202)
         ai_service = _ai_service_for_action(data)
         
-        # Get page_ids from request body and fetch filtered pages
+        # Get page_ids from request body and fetch filtered pages. Missing-only
+        # retry is based on readable artifacts, not the last attempt's status.
         selected_page_ids = parse_page_ids_from_body(data)
-        pages = get_filtered_pages(project_id, selected_page_ids if selected_page_ids else None)
+        all_pages = get_filtered_pages(project_id, None)
+        resume_missing = data.get('resume_missing') is True
         
-        if not pages:
+        if not all_pages:
             return bad_request("No pages found for project")
         
         # 检查是否有模板图片或风格描述
         from services import FileService
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
+        if resume_missing:
+            # A retry must recover the project's actual missing set. Reusing
+            # page_ids from an older request must not hide another missing page.
+            pages = [page for page in all_pages if not page_has_readable_image(page, file_service)]
+        else:
+            pages = get_filtered_pages(
+                project_id,
+                selected_page_ids if selected_page_ids else None,
+            )
+
+        if resume_missing and not pages:
+            task = Task(
+                project_id=project_id,
+                task_type='GENERATE_IMAGES',
+                status='COMPLETED',
+                completed_at=datetime.utcnow(),
+            )
+            task.set_progress({
+                'total': len(all_pages),
+                'completed': len(all_pages),
+                'generated': 0,
+                'retained': len(all_pages),
+                'available': len(all_pages),
+                'missing': 0,
+                'failed': 0,
+                'missing_page_ids': [],
+                'missing_page_numbers': [],
+                'page_errors': [],
+                'error_code': None,
+            })
+            db.session.add(task)
+            db.session.flush()
+            attach_task(receipt, task.id)
+            mark_completed(receipt)
+            project.status = 'COMPLETED'
+            db.session.commit()
+            return success_response({
+                'task_id': task.id,
+                'status': 'COMPLETED',
+                'total_pages': len(all_pages),
+                'target_pages': 0,
+            })
+
         use_template = data.get('use_template', True)
         ref_image_path = None
         if use_template:
@@ -1184,7 +1230,7 @@ def generate_images(project_id):
             return bad_request("请先上传模板图片或添加风格描述。")
         
         # Reconstruct outline from pages with part structure
-        outline = _reconstruct_outline_from_pages(pages)
+        outline = _reconstruct_outline_from_pages(all_pages)
         
         # 从配置中读取默认并发数，如果请求中提供了则使用请求的值
         try:
@@ -1203,9 +1249,16 @@ def generate_images(project_id):
             status='PENDING'
         )
         task.set_progress({
-            'total': len(pages),
-            'completed': 0,
-            'failed': 0
+            'total': len(all_pages),
+            'completed': len(all_pages) - len(pages) if resume_missing else 0,
+            'generated': 0,
+            'retained': len(all_pages) - len(pages) if resume_missing else 0,
+            'available': len(all_pages) - len(pages) if resume_missing else 0,
+            'missing': len(pages),
+            'failed': 0,
+            'missing_page_ids': [page.id for page in pages],
+            'missing_page_numbers': [page.order_index + 1 for page in pages],
+            'page_errors': [],
         })
         
         db.session.add(task)
@@ -1244,7 +1297,7 @@ def generate_images(project_id):
             app,
             combined_requirements if combined_requirements.strip() else None,
             language,
-            selected_page_ids if selected_page_ids else None,
+            [page.id for page in pages],
             image_prompt_field_names
         )
         
@@ -1255,7 +1308,8 @@ def generate_images(project_id):
         return success_response({
             'task_id': task.id,
             'status': 'GENERATING_IMAGES',
-            'total_pages': len(pages)
+            'total_pages': len(all_pages),
+            'target_pages': len(pages),
         }, status_code=202)
     
     except SubmissionConflict as e:
